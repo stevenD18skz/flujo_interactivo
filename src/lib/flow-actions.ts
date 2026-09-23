@@ -15,6 +15,7 @@ import {
   STATUSES,
   gatewayBranches,
   normalizeUrl,
+  withDocAliases,
   type ClosedState,
   type DocStatus,
   type Flow,
@@ -60,7 +61,7 @@ function cleanNodes(raw: unknown): Record<string, NodeState> {
 function cleanLinks(raw: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   if (!raw || typeof raw !== "object") return out;
-  for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [key, v] of Object.entries(withDocAliases(raw as Record<string, unknown>))) {
     const url = typeof v === "string" ? normalizeUrl(v) : null;
     if (DOC_SET.has(key) && url) out[key] = url;
   }
@@ -70,7 +71,7 @@ function cleanLinks(raw: unknown): Record<string, string> {
 function cleanDocs(raw: unknown): Record<string, DocStatus> {
   const out: Record<string, DocStatus> = {};
   if (!raw || typeof raw !== "object") return out;
-  for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [key, v] of Object.entries(withDocAliases(raw as Record<string, unknown>))) {
     if (DOC_SET.has(key) && typeof v === "string" && DOC_STATUS_SET.has(v) && v !== "empty") {
       out[key] = v as DocStatus;
     }
@@ -169,7 +170,7 @@ export async function deleteFlow(id: string) {
 
 export async function setNodeStatus(id: string, nodeId: string, s: Status) {
   check(isId(id) && NODE_IDS.has(nodeId) && STATUS_SET.has(s));
-  await db.patchNode(id, nodeId, { s });
+  await db.setNodeStatus(id, nodeId, s);
 }
 
 export async function setNodeNote(id: string, nodeId: string, n: string) {

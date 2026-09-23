@@ -27,13 +27,19 @@ import {
   DOC_STATUSES,
   PHASE_DOCS,
   W,
-  branchLockedNodes,
+  DECORATIVE_ARTIFACTS,
   dims,
+  disabledDocKeys,
+  docKey,
   docsForStep,
   gatewayBranches,
   leadsToEnd,
+  lockedArtifacts,
+  lockedNodes,
   normalizeUrl,
+  pendingDocsForStep,
   stepsForDoc,
+  summarize,
   upstreamPath,
   upstreamSteps,
   laneOf,
@@ -247,20 +253,24 @@ function Board({ flow }: { flow: Flow }) {
   // Camino ganador hacia el final cerrado: todo lo que NO esté aquí se atenúa y se bloquea.
   const closedPath = useMemo(() => (closed ? upstreamPath(closed.endId) : null), [closed]);
   const gatewayAnswers = flow.gatewayAnswers ?? NO_ANSWERS;
-  // Ramas descartadas por respuestas de compuertas ya guardadas (sin que el flujo
-  // esté cerrado del todo): se atenúan y se bloquean igual que el resto de un cierre.
-  const branchLocked = useMemo(() => branchLockedNodes(gatewayAnswers), [gatewayAnswers]);
-  const isLocked = (id: string) =>
-    closed !== null ? id !== closed.endId && !closedPath!.nodes.has(id) : branchLocked.has(id);
+  // Todo lo que quedó fuera del camino: con un final cerrado, lo que no lleva hasta él;
+  // si no, las ramas descartadas en las compuertas. Se atenúa y se bloquea.
+  const locked = useMemo(() => lockedNodes({ closed, gatewayAnswers }), [closed, gatewayAnswers]);
+  const isLocked = (id: string) => locked.has(id);
+  // Documentos cuyos pasos quedaron todos deshabilitados: también se deshabilitan
+  // (por lugar en el diagrama, y por nombre para las estadísticas y el panel).
+  const lockedArts = useMemo(() => lockedArtifacts(locked), [locked]);
+  const disabledDocs = useMemo(() => disabledDocKeys(lockedArts), [lockedArts]);
+  const sum = useMemo(
+    () => summarize({ nodes: flow.nodes, links, docs: docStatus, closed, gatewayAnswers }),
+    [flow.nodes, links, docStatus, closed, gatewayAnswers],
+  );
   // "Respondida" para el badge del rombo: si el cierre actual ya la resolvió, manda eso
   // (una respuesta vieja guardada no cuenta si quedó bloqueada por ese cierre).
   const isGatewayAnswered = (id: string) => {
     if (closed) return closedPath!.nodes.has(id);
     return Boolean(gatewayAnswers[id]);
   };
-  const done = EDITABLE.filter((n) => flow.nodes[n.id]?.s === "done").length;
-  const docsLinked = DOC_KEYS.filter((k) => links[k]).length;
-  const docsDone = DOC_KEYS.filter((k) => docStatus[k] === "done").length;
   const openNode = openId ? BY_ID[openId] : null;
   const toggle = (id: string) => setOpenId((cur) => (cur === id ? null : id));
 
@@ -312,8 +322,15 @@ function Board({ flow }: { flow: Flow }) {
         <div className={styles.spacer} />
         <SyncBadge />
         <ThemeToggle className={styles.tb} />
-        <span className={styles.progress}>
-          {done} / {EDITABLE.length} listas
+        <span
+          className={styles.progress}
+          title={
+            sum.total < EDITABLE.length
+              ? `${EDITABLE.length - sum.total} pasos deshabilitados no cuentan (quedaron fuera del camino)`
+              : undefined
+          }
+        >
+          {sum.counts.done} / {sum.total} listas
         </span>
         <button
           type="button"
@@ -324,8 +341,8 @@ function Board({ flow }: { flow: Flow }) {
           title="Ver y gestionar todos los documentos del flujo"
         >
           <DocGlyph />
-          {docsLinked} / {DOC_KEYS.length} docs con enlace
-          <span className={styles.docsBtnDone}>{docsDone} completos</span>
+          {sum.docs.linked} / {sum.docs.total} docs con enlace
+          <span className={styles.docsBtnDone}>{sum.docs.done} completos</span>
         </button>
         <button
           type="button"
@@ -379,7 +396,8 @@ function Board({ flow }: { flow: Flow }) {
               closed={closed}
               closedPath={closedPath}
               gatewayAnswers={gatewayAnswers}
-              branchLocked={branchLocked}
+              locked={locked}
+              lockedArts={lockedArts}
             />
             {EDITABLE.map((n) => (
               <StepNode
@@ -388,6 +406,9 @@ function Board({ flow }: { flow: Flow }) {
                 state={flow.nodes[n.id]}
                 selected={openId === n.id}
                 dimmed={isLocked(n.id)}
+                pendingDocs={
+                  flow.nodes[n.id]?.s === "done" && !isLocked(n.id) ? pendingDocsForStep(n.id, docStatus).length : 0
+                }
                 nodeRef={(el) => {
                   nodeEls.current[n.id] = el;
                 }}
@@ -398,7 +419,8 @@ function Board({ flow }: { flow: Flow }) {
               <ArtifactNode
                 key={n.id}
                 node={n}
-                url={links[n.l]}
+                url={links[docKey(n)]}
+                dimmed={lockedArts.has(n.id)}
                 selected={openId === n.id}
                 nodeRef={(el) => {
                   nodeEls.current[n.id] = el;
@@ -477,8 +499,9 @@ function Board({ flow }: { flow: Flow }) {
               key={openNode.id}
               flowId={flow.id}
               node={openNode}
-              url={links[openNode.l]}
-              status={docStatus[openNode.l] ?? "empty"}
+              url={links[docKey(openNode)]}
+              status={docStatus[docKey(openNode)] ?? "empty"}
+              locked={lockedArts.has(openNode.id)}
               onClose={() => setOpenId(null)}
             />
           ) : (
@@ -502,6 +525,7 @@ function Board({ flow }: { flow: Flow }) {
           flowId={flow.id}
           links={links}
           docStatus={docStatus}
+          disabled={disabledDocs}
           onClose={() => setPanel(null)}
           onGo={focusNode}
         />
@@ -582,6 +606,7 @@ function StepNode({
   state,
   selected,
   dimmed,
+  pendingDocs,
   nodeRef,
   onClick,
 }: {
@@ -589,6 +614,8 @@ function StepNode({
   state: NodeState | undefined;
   selected: boolean;
   dimmed: boolean;
+  /** Documentos del paso sin completar (solo se avisa si el paso ya está Done). */
+  pendingDocs: number;
   nodeRef: (el: HTMLButtonElement | null) => void;
   onClick: () => void;
 }) {
@@ -608,10 +635,20 @@ function StepNode({
         borderWidth: node.t === "s" ? 2.6 : undefined,
       }}
       onClick={onClick}
+      aria-label={pendingDocs > 0 ? `${node.l} (falta completar ${pendingDocs === 1 ? "un documento" : `${pendingDocs} documentos`})` : undefined}
     >
       <span className={styles.txt}>{node.l}</span>
       <i className={styles.badge} />
       {state?.n?.trim() && <i className={styles.noteflag}>✎</i>}
+      {pendingDocs > 0 && (
+        <i
+          className={styles.warnflag}
+          title={pendingDocs === 1 ? "Falta completar un documento de este paso" : `Faltan completar ${pendingDocs} documentos de este paso`}
+          aria-hidden
+        >
+          ⚠ Doc
+        </i>
+      )}
     </button>
   );
 }
@@ -653,11 +690,12 @@ function StepEditor({
   );
 
   useEffect(() => {
-    if (saved !== "Guardado") return;
-    const t = setTimeout(() => setSaved(""), 1400);
+    if (!saved || saved === "Guardando…") return;
+    const t = setTimeout(() => setSaved(""), saved === "Guardado" ? 1400 : 5000);
     return () => clearTimeout(t);
   }, [saved]);
 
+  const pendingDocs = status === "done" && !locked ? pendingDocsForStep(node.id, docStatus) : [];
   const urls = (draft.match(/https?:\/\/[^\s<>"')]+/g) ?? []).slice(0, 8);
 
   return (
@@ -684,8 +722,16 @@ function StepEditor({
             aria-pressed={status === s.key}
             disabled={locked}
             onClick={() => {
-              setNodeStatus(flowId, node.id, s.key);
-              setSaved("Guardado");
+              const marked = setNodeStatus(flowId, node.id, s.key);
+              if (!marked.length) {
+                setSaved("Guardado");
+                return;
+              }
+              const withPending = marked.filter((id) => pendingDocsForStep(id, docStatus).length > 0).length;
+              setSaved(
+                `Guardado · ${marked.length === 1 ? "1 paso anterior también quedó" : `${marked.length} pasos anteriores también quedaron`} en Done` +
+                  (withPending ? ` (${withPending} con documentos sin completar)` : ""),
+              );
             }}
           >
             {s.label}
@@ -695,14 +741,22 @@ function StepEditor({
       {docs.length > 0 && (
         <>
           <p className={styles.lbl}>Documentos</p>
+          {pendingDocs.length > 0 && (
+            <p className={styles.warn} role="status">
+              ⚠ Este paso está en Done pero falta completar{" "}
+              {pendingDocs.length === 1 ? "su documento" : `${pendingDocs.length} de sus documentos`}. Márcalo
+              «Completo» cuando esté listo.
+            </p>
+          )}
           <div className={styles.docs}>
             {docs.map((d) => (
               <DocLinkRow
                 key={d.id}
                 flowId={flowId}
                 doc={d}
-                url={links[d.l]}
-                status={docStatus[d.l] ?? "empty"}
+                url={links[docKey(d)]}
+                status={docStatus[docKey(d)] ?? "empty"}
+                locked={locked}
               />
             ))}
           </div>
@@ -770,7 +824,15 @@ function DbGlyph() {
 }
 
 /** Selector de estado de un documento (Vacío / En progreso / Completo). */
-function DocStatusSeg({ value, onChange }: { value: DocStatus; onChange: (s: DocStatus) => void }) {
+function DocStatusSeg({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: DocStatus;
+  disabled?: boolean;
+  onChange: (s: DocStatus) => void;
+}) {
   return (
     <div className={styles.seg} role="radiogroup" aria-label="Estado del documento">
       {DOC_STATUSES.map((s) => (
@@ -781,6 +843,7 @@ function DocStatusSeg({ value, onChange }: { value: DocStatus; onChange: (s: Doc
           aria-checked={value === s.key}
           data-ds={s.key}
           className={styles.segBtn}
+          disabled={disabled}
           onClick={() => value !== s.key && onChange(s.key)}
         >
           {s.label}
@@ -802,12 +865,15 @@ function DocsDrawer({
   flowId,
   links,
   docStatus,
+  disabled,
   onClose,
   onGo,
 }: {
   flowId: string;
   links: Record<string, string>;
   docStatus: Record<string, DocStatus>;
+  /** Documentos deshabilitados (todos sus pasos quedaron fuera del camino): no cuentan. */
+  disabled: Set<string>;
   onClose: () => void;
   onGo: (nodeId: string) => void;
 }) {
@@ -815,12 +881,20 @@ function DocsDrawer({
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => closeRef.current?.focus(), []);
 
+  const active = DOC_KEYS.filter((k) => !disabled.has(k));
   const statusOf = (key: string) => docStatus[key] ?? "empty";
-  const count = (s: DocStatus) => DOC_KEYS.filter((k) => statusOf(k) === s).length;
-  const total = DOC_KEYS.length;
+  const count = (s: DocStatus) => active.filter((k) => statusOf(k) === s).length;
+  const total = active.length;
+  // Los deshabilitados solo salen en "Todos" (al final de su fase); nunca están pendientes.
   const matches = (key: string) =>
-    filter === "all" || (filter === "pending" ? statusOf(key) !== "done" : !links[key]);
-  const groups = PHASE_DOCS.map((g) => ({ ...g, shown: g.docs.filter((d) => matches(d.key)) }));
+    filter === "all" || (!disabled.has(key) && (filter === "pending" ? statusOf(key) !== "done" : !links[key]));
+  const groups = PHASE_DOCS.map((g) => ({
+    ...g,
+    active: g.docs.filter((d) => !disabled.has(d.key)),
+    shown: g.docs
+      .filter((d) => matches(d.key))
+      .sort((a, b) => Number(disabled.has(a.key)) - Number(disabled.has(b.key))),
+  }));
 
   return (
     <aside id="docs-drawer" className={styles.drawer} aria-label="Documentos del flujo">
@@ -828,7 +902,8 @@ function DocsDrawer({
         <div>
           <h2 className={styles.drawerTitle}>Documentos del flujo</h2>
           <p className={styles.drawerSub}>
-            {count("done")} de {total} completos · {DOC_KEYS.filter((k) => links[k]).length} con enlace
+            {count("done")} de {total} completos · {active.filter((k) => links[k]).length} con enlace
+            {disabled.size > 0 && ` · ${disabled.size} deshabilitados`}
           </p>
         </div>
         <button
@@ -842,8 +917,8 @@ function DocsDrawer({
         </button>
       </header>
       <div className={styles.drawerMeter} aria-hidden>
-        <span data-ds="done" style={{ width: `${(count("done") / total) * 100}%` }} />
-        <span data-ds="prog" style={{ width: `${(count("prog") / total) * 100}%` }} />
+        <span data-ds="done" style={{ width: `${total ? (count("done") / total) * 100 : 0}%` }} />
+        <span data-ds="prog" style={{ width: `${total ? (count("prog") / total) * 100 : 0}%` }} />
       </div>
       <div className={styles.drawerLegend}>
         {DOC_STATUSES.map((s) => (
@@ -873,7 +948,9 @@ function DocsDrawer({
                 <h3 className={styles.phaseHead}>
                   <span>{g.phase}</span>
                   <span className={styles.phaseCount}>
-                    {g.docs.filter((d) => statusOf(d.key) === "done").length}/{g.docs.length} completos
+                    {g.active.length
+                      ? `${g.active.filter((d) => statusOf(d.key) === "done").length}/${g.active.length} completos`
+                      : "deshabilitada"}
                   </span>
                 </h3>
                 <ul className={styles.dlist}>
@@ -885,6 +962,7 @@ function DocsDrawer({
                       node={d.node}
                       url={links[d.key]}
                       status={statusOf(d.key)}
+                      disabled={disabled.has(d.key)}
                       onGo={onGo}
                     />
                   ))}
@@ -910,6 +988,7 @@ function DrawerDoc({
   node,
   url,
   status,
+  disabled,
   onGo,
 }: {
   flowId: string;
@@ -917,6 +996,7 @@ function DrawerDoc({
   node: FlowNode;
   url: string | undefined;
   status: DocStatus;
+  disabled: boolean;
   onGo: (nodeId: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -925,12 +1005,15 @@ function DrawerDoc({
   const steps = stepsForDoc(docKey).filter((s) => phaseOf(s.x) === phase);
 
   return (
-    <li className={styles.dcard} data-ds={status}>
+    <li className={`${styles.dcard} ${disabled ? styles.dcardOff : ""}`} data-ds={status}>
       <div className={styles.dcardTop}>
         <span className={styles.dicon}>{node.t === "d" ? <DocGlyph /> : <DbGlyph />}</span>
         <div className={styles.dmain}>
           <p className={styles.dname}>{docKey}</p>
           {steps.length > 0 && <p className={styles.dused}>{steps.map((s) => s.l).join(" · ")}</p>}
+          {disabled && (
+            <p className={styles.dused}>🔒 Deshabilitado: sus pasos quedaron fuera del camino. No cuenta en el avance.</p>
+          )}
         </div>
         <button
           type="button"
@@ -943,6 +1026,7 @@ function DrawerDoc({
       </div>
       <DocStatusSeg
         value={status}
+        disabled={disabled}
         onChange={(s) => {
           setDocStatus(flowId, docKey, s);
           setFlash("Estado actualizado");
@@ -954,7 +1038,7 @@ function DrawerDoc({
             Abrir ↗
           </a>
         )}
-        {!editing && (
+        {!editing && !disabled && (
           <button type="button" className={styles.docAction} onClick={() => setEditing(true)}>
             {url ? "Editar enlace" : "+ Agregar enlace"}
           </button>
@@ -1002,12 +1086,15 @@ const isGateway = (n: FlowNode) => n.t === "g";
 function ArtifactNode({
   node,
   url,
+  dimmed,
   selected,
   nodeRef,
   onEdit,
 }: {
   node: FlowNode;
   url: string | undefined;
+  /** Todos los pasos que lo usan quedaron deshabilitados: solo se puede ver. */
+  dimmed: boolean;
   selected: boolean;
   nodeRef: (el: HTMLDivElement | null) => void;
   onEdit: () => void;
@@ -1017,7 +1104,7 @@ function ArtifactNode({
     <div
       ref={nodeRef}
       data-node
-      className={`${styles.art} ${url ? styles.artLinked : ""} ${selected ? styles.artSel : ""}`}
+      className={`${styles.art} ${url ? styles.artLinked : ""} ${selected ? styles.artSel : ""} ${dimmed ? styles.artOff : ""}`}
       style={{ left: node.x - d.w / 2, top: node.y - d.h / 2, width: d.w, height: d.h }}
     >
       {url ? (
@@ -1048,12 +1135,14 @@ function ArtifactNode({
               e.preventDefault();
               onEdit();
             }}
-            title="Clic para agregar el enlace"
-            aria-label={`Agregar enlace a ${node.l}`}
+            title={dimmed ? "Deshabilitado: sus pasos quedaron fuera del camino" : "Clic para agregar el enlace"}
+            aria-label={dimmed ? `${node.l} (deshabilitado)` : `Agregar enlace a ${node.l}`}
           />
-          <span className={styles.artTip} aria-hidden>
-            + Agregar enlace
-          </span>
+          {!dimmed && (
+            <span className={styles.artTip} aria-hidden>
+              + Agregar enlace
+            </span>
+          )}
         </>
       )}
     </div>
@@ -1149,18 +1238,22 @@ function DocPanel({
   node,
   url,
   status,
+  locked,
   onClose,
 }: {
   flowId: string;
   node: FlowNode;
   url: string | undefined;
   status: DocStatus;
+  /** Todos los pasos que usan este documento (aquí) quedaron deshabilitados. */
+  locked: boolean;
   onClose: () => void;
 }) {
-  const [editing, setEditing] = useState(!url);
+  const key = docKey(node);
+  const [editing, setEditing] = useState(!url && !locked);
   const [flash, setFlash] = useFlash();
-  const steps = stepsForDoc(node.l);
-  const places = ARTIFACTS.filter((a) => a.l === node.l).length;
+  const steps = stepsForDoc(key);
+  const places = ARTIFACTS.filter((a) => docKey(a) === key).length;
 
   return (
     <>
@@ -1168,11 +1261,17 @@ function DocPanel({
       <div className={styles.crumb}>
         {node.t === "d" ? "Documento" : "Sistema / repositorio"} · {phaseOf(node.x)}
       </div>
+      {locked && (
+        <p className={styles.hint} style={{ margin: "0 0 10px" }}>
+          🔒 Deshabilitado: los pasos que lo usan aquí quedaron fuera del camino elegido. Solo se puede ver.
+        </p>
+      )}
       <p className={styles.lbl}>Estado</p>
       <DocStatusSeg
         value={status}
+        disabled={locked}
         onChange={(s) => {
-          setDocStatus(flowId, node.l, s);
+          setDocStatus(flowId, key, s);
           setFlash("Estado actualizado");
         }}
       />
@@ -1197,19 +1296,23 @@ function DocPanel({
             {url}
           </p>
         </>
+      ) : locked ? (
+        <p className={styles.hint} style={{ margin: 0 }}>
+          Sin enlace.
+        </p>
       ) : (
         <DocLinkForm
           key={url ?? "nuevo"}
           initial={url}
           onSave={(u) => {
-            setDocLink(flowId, node.l, u);
+            setDocLink(flowId, key, u);
             setEditing(false);
             setFlash(url ? "Enlace actualizado" : "Enlace guardado");
           }}
           onRemove={
             url
               ? () => {
-                  setDocLink(flowId, node.l, null);
+                  setDocLink(flowId, key, null);
                   setFlash("Enlace eliminado");
                 }
               : undefined
@@ -1219,7 +1322,7 @@ function DocPanel({
       )}
       {places > 1 && (
         <p className={styles.hint}>
-          Este documento aparece en {places} lugares del flujo; el enlace se comparte entre todos.
+          Este documento aparece en {places} lugares del flujo; el enlace y el estado se comparten entre todos.
         </p>
       )}
       <div className={styles.foot}>
@@ -1227,7 +1330,7 @@ function DocPanel({
           {flash && `✓ ${flash}`}
         </span>
         <span className={styles.grp}>
-          {url && !editing && (
+          {url && !editing && !locked && (
             <button type="button" className={styles.tb} onClick={() => setEditing(true)}>
               Editar enlace
             </button>
@@ -1451,14 +1554,18 @@ function DocLinkRow({
   doc,
   url,
   status,
+  locked,
 }: {
   flowId: string;
   doc: FlowNode;
   url: string | undefined;
   status: DocStatus;
+  /** El paso está deshabilitado: el documento solo se puede ver/abrir. */
+  locked: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [flash, setFlash] = useFlash();
+  const key = docKey(doc);
   const i = DOC_STATUSES.findIndex((s) => s.key === status);
   const current = DOC_STATUSES[i];
   const next = DOC_STATUSES[(i + 1) % DOC_STATUSES.length];
@@ -1470,7 +1577,8 @@ function DocLinkRow({
           type="button"
           className={styles.dsPill}
           data-ds={status}
-          onClick={() => setDocStatus(flowId, doc.l, next.key)}
+          disabled={locked}
+          onClick={() => setDocStatus(flowId, key, next.key)}
           title={`Estado: ${current.label}. Clic para marcar «${next.label}»`}
           aria-label={`Estado de ${doc.l}: ${current.label}. Cambiar a ${next.label}`}
         >
@@ -1491,9 +1599,11 @@ function DocLinkRow({
                   Abrir ↗
                 </a>
               )}
-              <button type="button" className={styles.docAction} onClick={() => setEditing(true)}>
-                {url ? "Editar" : "+ Enlace"}
-              </button>
+              {!locked && (
+                <button type="button" className={styles.docAction} onClick={() => setEditing(true)}>
+                  {url ? "Editar" : "+ Enlace"}
+                </button>
+              )}
             </>
           )
         )}
@@ -1502,14 +1612,14 @@ function DocLinkRow({
         <DocLinkForm
           initial={url}
           onSave={(u) => {
-            setDocLink(flowId, doc.l, u);
+            setDocLink(flowId, key, u);
             setEditing(false);
             setFlash(url ? "Actualizado" : "Guardado");
           }}
           onRemove={
             url
               ? () => {
-                  setDocLink(flowId, doc.l, null);
+                  setDocLink(flowId, key, null);
                   setEditing(false);
                   setFlash("Eliminado");
                 }
@@ -1617,26 +1727,27 @@ const Diagram = memo(function Diagram({
   closed,
   closedPath,
   gatewayAnswers,
-  branchLocked,
+  locked,
+  lockedArts,
 }: {
   linked: Set<string>;
   docStatus: Record<string, DocStatus>;
   closed: ClosedState | null;
   closedPath: UpstreamPath | null;
   gatewayAnswers: Record<string, string>;
-  branchLocked: Set<string>;
+  /** Nodos deshabilitados (ver lockedNodes): el final activo nunca está aquí. */
+  locked: Set<string>;
+  /** Documentos del diagrama deshabilitados (ver lockedArtifacts). */
+  lockedArts: Set<string>;
 }) {
   const closedEndId = closed?.endId ?? null;
-  // El final activo nunca se atenúa (upstreamPath no se incluye a sí mismo en `nodes`).
-  // Sin cierre, se atenúa lo que quedó fuera de la rama elegida en alguna compuerta.
-  const dimNode = (id: string) =>
-    closedPath !== null ? id !== closedEndId && !closedPath.nodes.has(id) : branchLocked.has(id);
+  const dimNode = (id: string) => locked.has(id);
   // Una flecha se atenúa por el cierre actual, o (sin cierre) si conecta con un nodo
   // que quedó bloqueado por la rama descartada de alguna compuerta.
   const dimEdge = (i: number) => {
     if (closedPath !== null) return !closedPath.edges.has(i);
     const [from, , to] = EDGES[i];
-    return branchLocked.has(from) || branchLocked.has(to);
+    return locked.has(from) || locked.has(to);
   };
   const poolTop = LANES[0].y0;
   const poolBot = LANES[LANES.length - 1].y1;
@@ -1787,14 +1898,16 @@ const Diagram = memo(function Diagram({
           const y = n.y - d.h / 2;
           const lines = wrapWords(n.l, 15);
           const startY = y - 6 - (lines.length - 1) * 13;
-          const isLinked = linked.has(n.l);
-          const st = docStatus[n.l] ?? "empty";
+          // Los decorativos (p. ej. "Stock Tecnológico") se dibujan siempre vacíos: no son documentos.
+          const decorative = DECORATIVE_ARTIFACTS.has(n.id);
+          const isLinked = !decorative && linked.has(docKey(n));
+          const st = decorative ? "empty" : (docStatus[docKey(n)] ?? "empty");
           // El color dice el estado; un documento vacío pero enlazado se ve azul.
           const artStyle =
             st === "empty" && isLinked ? { fill: "var(--link-fill)", stroke: "var(--accent)" } : DOC_COLORS[st];
           const sw = st !== "empty" || isLinked ? 2.4 : 1.6;
           return (
-            <g key={n.id}>
+            <g key={n.id} opacity={lockedArts.has(n.id) ? DIM_OPACITY : 1}>
               {n.t === "d" ? (
                 <path
                   d={`M${x},${y} H${x + d.w} V${y + d.h - 14} L${x + d.w - 14},${y + d.h} H${x} Z`}
@@ -1848,7 +1961,7 @@ const Diagram = memo(function Diagram({
             style={{ stroke: "var(--doc-line)" }}
             strokeWidth={1.4}
             strokeDasharray="5 5"
-            opacity={0.75}
+            opacity={lockedArts.has(a) || locked.has(b) ? DIM_OPACITY : 0.75}
           />
         ))}
 

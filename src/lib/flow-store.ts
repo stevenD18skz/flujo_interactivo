@@ -5,9 +5,11 @@
 
 import { useSyncExternalStore } from "react";
 import {
-  branchLock,
-  gatewayBranches,
+  aliasesOf,
+  priorCompletion,
   upstreamSteps,
+  withDocAliases,
+  type Completion,
   type DocStatus,
   type Flow,
   type Material,
@@ -56,7 +58,9 @@ function emit() {
 function readLocal(): Flow[] {
   try {
     const parsed = JSON.parse(localStorage.getItem(KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed)
+      ? parsed.map((f: Flow) => ({ ...f, links: withDocAliases(f.links ?? {}), docs: withDocAliases(f.docs ?? {}) }))
+      : [];
   } catch {
     return [];
   }
@@ -231,9 +235,30 @@ export function deleteFlow(id: string) {
   persist(() => remoteDelete(id));
 }
 
-export function setNodeStatus(id: string, nodeId: string, s: Status) {
-  updateFlow(id, (f) => ({ ...f, nodes: { ...f.nodes, [nodeId]: { ...f.nodes[nodeId], s } } }));
+/** Aplica `priorCompletion`: pasos previos a Done y compuertas del camino respondidas. */
+function applyCompletion(f: Flow, { steps, answers }: Completion): { flow: Flow; marked: string[] } {
+  const nodes = { ...f.nodes };
+  const marked = steps.filter((sid) => nodes[sid]?.s !== "done");
+  for (const sid of marked) nodes[sid] = { ...nodes[sid], s: "done" };
+  return { flow: { ...f, nodes, gatewayAnswers: { ...f.gatewayAnswers, ...answers } }, marked };
+}
+
+/**
+ * Cambia el estado de un paso. Sacarlo de TODO (In progress, For test o Done)
+ * implica que ya se hizo todo lo anterior: esos pasos pasan a Done y las
+ * compuertas del camino quedan respondidas. Devuelve los ids de los pasos previos que cambiaron a Done.
+ */
+export function setNodeStatus(id: string, nodeId: string, s: Status): string[] {
+  let marked: string[] = [];
+  updateFlow(id, (f) => {
+    const next = { ...f, nodes: { ...f.nodes, [nodeId]: { ...f.nodes[nodeId], s } } };
+    if (s === "todo") return next;
+    const res = applyCompletion(next, priorCompletion(nodeId));
+    marked = res.marked;
+    return res.flow;
+  });
   persist(() => remoteSetStatus(id, nodeId, s));
+  return marked;
 }
 
 export function setNodeNote(id: string, nodeId: string, n: string) {
@@ -245,6 +270,7 @@ export function setNodeNote(id: string, nodeId: string, n: string) {
 export function setDocLink(id: string, docKey: string, url: string | null) {
   updateFlow(id, (f) => {
     const links = { ...f.links };
+    for (const alias of aliasesOf(docKey)) delete links[alias];
     if (url) links[docKey] = url;
     else delete links[docKey];
     return { ...f, links };
@@ -283,6 +309,7 @@ export function removeMaterial(flowId: string, id: string) {
 export function setDocStatus(id: string, docKey: string, status: DocStatus) {
   updateFlow(id, (f) => {
     const docs = { ...f.docs };
+    for (const alias of aliasesOf(docKey)) delete docs[alias];
     if (status === "empty") delete docs[docKey];
     else docs[docKey] = status;
     return { ...f, docs };
@@ -326,26 +353,19 @@ export function reopenEnd(flowId: string, endId: string) {
 
 /**
  * Respuesta de una compuerta que NO lleva directo a un final (`target: null` la
- * borra). Responder implica que ya se completaron los pasos previos que llevaron
- * hasta acá, así que se marcan "done" (salvo los que pertenecen exclusivamente a
- * la rama que NO se tomó, que quedan bloqueados en vez de completados).
+ * borra). Responder implica que ya se llegó hasta acá: los pasos previos quedan
+ * "done" y las compuertas anteriores respondidas (ver priorCompletion; la rama
+ * elegida no cuenta, en un rework-loop todavía no ocurrió esta vuelta).
  */
 export function setGatewayAnswer(flowId: string, gatewayId: string, target: string | null) {
   updateFlow(flowId, (f) => {
     const gatewayAnswers = { ...f.gatewayAnswers };
-    if (target) gatewayAnswers[gatewayId] = target;
-    else delete gatewayAnswers[gatewayId];
-    if (!target) return { ...f, gatewayAnswers };
-    const other = gatewayBranches(gatewayId).find((b) => b.target !== target);
-    const discarded = other ? branchLock(other.target) : new Set<string>();
-    // La rama elegida también se excluye: en un rework-loop (p. ej. "No, hay que
-    // corregir") el paso de corrección es ancestro de la compuerta por el ciclo,
-    // pero todavía no ocurrió esta vuelta, así que no debe marcarse "done".
-    const chosenForward = branchLock(target);
-    const toMarkDone = upstreamSteps(gatewayId).filter((id) => !discarded.has(id) && !chosenForward.has(id));
-    const nodes = { ...f.nodes };
-    for (const id of toMarkDone) nodes[id] = { ...nodes[id], s: "done" as Status };
-    return { ...f, gatewayAnswers, nodes };
+    if (!target) {
+      delete gatewayAnswers[gatewayId];
+      return { ...f, gatewayAnswers };
+    }
+    const { flow } = applyCompletion(f, priorCompletion(gatewayId));
+    return { ...flow, gatewayAnswers: { ...flow.gatewayAnswers, [gatewayId]: target } };
   });
   persist(() => remoteSetGatewayAnswer(flowId, gatewayId, target));
 }

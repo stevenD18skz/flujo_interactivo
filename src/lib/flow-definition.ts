@@ -32,10 +32,10 @@ export interface Flow {
   /** Si no es null/undefined, el flujo está cerrado: ver ClosedState. */
   closed?: ClosedState | null;
   /**
-   * Respuesta elegida en cada compuerta (Sí/No…) que NO lleva directo a un final,
-   * por id de la compuerta → id del nodo al que lleva la rama elegida. Las que sí
-   * llevan directo a un final no se guardan aquí: cerrar ese final (ver `closed`)
-   * ya deja registrada cuál rama se tomó.
+   * Respuesta elegida en cada compuerta (Sí/No…), por id de la compuerta → id del
+   * nodo al que lleva la rama elegida. Al responder a mano una rama que lleva directo
+   * a un final no se guarda aquí: se cierra ese final (ver `closed`). También se
+   * llenan solas al completar un paso posterior (ver priorCompletion).
    */
   gatewayAnswers?: Record<string, string>;
 }
@@ -339,14 +339,49 @@ export const ASSOCIATIONS: [string, string][] = [
   ["d12", "t37"], ["d13", "t37"], ["d14", "t41"],
 ];
 
+/**
+ * Artefactos solo decorativos: se dibujan en el diagrama pero no son documentos
+ * (no llevan enlace ni estado, y no cuentan en las estadísticas).
+ */
+export const DECORATIVE_ARTIFACTS = new Set(["b3"]);
+
 /** Documentos (d) y repositorios/sistemas (b) que acompañan a los pasos. */
-export const ARTIFACTS = NODES.filter((n) => n.t === "d" || n.t === "b");
+export const ARTIFACTS = NODES.filter((n) => (n.t === "d" || n.t === "b") && !DECORATIVE_ARTIFACTS.has(n.id));
+
+/**
+ * Nombres distintos en el diagrama que en realidad son el mismo documento: comparten
+ * enlace y estado bajo el nombre de la derecha.
+ */
+export const DOC_ALIASES: Record<string, string> = {
+  "Inventario Célula Operaciones": "Inventario de la célula",
+};
 
 /**
  * Los enlaces se guardan por nombre del documento: un mismo documento que aparece en
  * varios lugares del flujo (p. ej. "Inventario de la célula") comparte un solo enlace.
  */
-export const DOC_KEYS = [...new Set(ARTIFACTS.map((n) => n.l))];
+export const docKey = (n: FlowNode) => DOC_ALIASES[n.l] ?? n.l;
+
+export const DOC_KEYS = [...new Set(ARTIFACTS.map(docKey))];
+
+/** Nombres viejos que apuntan a `key` (se borran al escribir `key`, ver withDocAliases). */
+export function aliasesOf(key: string): string[] {
+  return Object.keys(DOC_ALIASES).filter((a) => DOC_ALIASES[a] === key);
+}
+
+/**
+ * Flujos guardados antes de unificar documentos pueden tener el enlace/estado bajo un
+ * alias: si el nombre unificado no tiene valor, se toma el del alias.
+ */
+export function withDocAliases<T>(record: Record<string, T>): Record<string, T> {
+  let out = record;
+  for (const [alias, key] of Object.entries(DOC_ALIASES)) {
+    if (record[alias] !== undefined && record[key] === undefined) {
+      out = { ...out, [key]: record[alias] };
+    }
+  }
+  return out;
+}
 
 export type DocStatus = "empty" | "prog" | "done";
 
@@ -363,17 +398,25 @@ export const DOC_STATUSES: { key: DocStatus; label: string }[] = [
 export const PHASE_DOCS = PHASES.map((p) => {
   const seen = new Map<string, FlowNode>();
   for (const n of [...ARTIFACTS].sort((a, b) => a.x - b.x)) {
-    if (phaseOf(n.x) === p.n && !seen.has(n.l)) seen.set(n.l, n);
+    if (phaseOf(n.x) === p.n && !seen.has(docKey(n))) seen.set(docKey(n), n);
   }
   return { phase: p.n, docs: [...seen].map(([key, node]) => ({ key, node })) };
 });
 
 export function docsForStep(stepId: string): FlowNode[] {
-  return ASSOCIATIONS.filter(([, s]) => s === stepId).map(([a]) => BY_ID[a]);
+  return ASSOCIATIONS.filter(([a, s]) => s === stepId && !DECORATIVE_ARTIFACTS.has(a)).map(([a]) => BY_ID[a]);
 }
 
-export function stepsForDoc(label: string): FlowNode[] {
-  return ASSOCIATIONS.filter(([a]) => BY_ID[a].l === label).map(([, s]) => BY_ID[s]);
+/** Pasos que usan un documento, en cualquiera de los lugares donde aparece. */
+export function stepsForDoc(key: string): FlowNode[] {
+  return ASSOCIATIONS.filter(([a]) => !DECORATIVE_ARTIFACTS.has(a) && docKey(BY_ID[a]) === key).map(
+    ([, s]) => BY_ID[s],
+  );
+}
+
+/** Documentos de un paso que todavía no están "Completo". */
+export function pendingDocsForStep(stepId: string, docStatus: Record<string, DocStatus>): FlowNode[] {
+  return docsForStep(stepId).filter((d) => docStatus[docKey(d)] !== "done");
 }
 
 /** Devuelve la URL normalizada (http/https) o `null` si no es un enlace web válido. */
@@ -542,6 +585,91 @@ export function branchLockedNodes(gatewayAnswers: Record<string, string>): Set<s
   return locked;
 }
 
+/**
+ * Flechas de "vuelta atrás" de los ciclos de corrección (p. ej. t21 → t20, t3 → t2):
+ * las que, recorriendo el flujo desde el inicio, apuntan a un nodo que todavía está
+ * en el camino actual. Sin ellas el flujo es un grafo sin ciclos.
+ */
+const BACK_EDGES: Set<number> = (() => {
+  const back = new Set<number>();
+  const state = new Map<string, "open" | "done">();
+  const visit = (id: string) => {
+    state.set(id, "open");
+    EDGES.forEach((e, i) => {
+      if (e[0] !== id) return;
+      const s = state.get(e[2]);
+      if (s === "open") back.add(i);
+      else if (!s) visit(e[2]);
+    });
+    state.set(id, "done");
+  };
+  for (const n of NODES) if (!state.has(n.id) && inDegree(n.id) === 0) visit(n.id);
+  return back;
+})();
+
+export interface Completion {
+  /** Pasos (t/s) anteriores que quedan "done". */
+  steps: string[];
+  /** Compuertas del camino → rama que lleva hasta el nodo (ver Flow.gatewayAnswers). */
+  answers: Record<string, string>;
+}
+
+/**
+ * Lo que implica que un nodo ya se alcanzó: todo lo que está antes (siguiendo las
+ * flechas hacia atrás, sin cruzar las vueltas de corrección, que todavía no
+ * ocurrieron) quedó hecho, y cada compuerta del camino se respondió con la rama que
+ * lleva hasta acá (la otra rama queda deshabilitada, ver branchLockedNodes).
+ */
+export function priorCompletion(nodeId: string): Completion {
+  const seen = new Set<string>();
+  const visit = (id: string) => {
+    EDGES.forEach((e, i) => {
+      if (e[2] !== id || BACK_EDGES.has(i) || seen.has(e[0])) return;
+      seen.add(e[0]);
+      visit(e[0]);
+    });
+  };
+  visit(nodeId);
+  seen.delete(nodeId);
+  const steps = [...seen].filter((id) => BY_ID[id].t === "t" || BY_ID[id].t === "s");
+  const answers: Record<string, string> = {};
+  for (const id of seen) {
+    if (BY_ID[id].t !== "g") continue;
+    const taken = gatewayBranches(id).filter(
+      (b) => !BACK_EDGES.has(b.edgeIndex) && (b.target === nodeId || seen.has(b.target)),
+    );
+    if (taken.length === 1) answers[id] = taken[0].target;
+  }
+  return { steps, answers };
+}
+
+/**
+ * Nodos del flujo (pasos, compuertas, eventos…) deshabilitados: con un final cerrado,
+ * todo lo que no lleva hasta él; si no, las ramas descartadas en las compuertas.
+ * Los documentos no entran aquí: ver lockedArtifacts.
+ */
+export function lockedNodes({ closed, gatewayAnswers }: Pick<Flow, "closed" | "gatewayAnswers">): Set<string> {
+  if (!closed) return branchLockedNodes(gatewayAnswers ?? {});
+  const path = upstreamPath(closed.endId);
+  return new Set(
+    NODES.filter((n) => n.t !== "d" && n.t !== "b" && n.id !== closed.endId && !path.nodes.has(n.id)).map(
+      (n) => n.id,
+    ),
+  );
+}
+
+/** Documentos del diagrama (por id) cuyos pasos están todos deshabilitados. */
+export function lockedArtifacts(locked: Set<string>): Set<string> {
+  return new Set(
+    ARTIFACTS.filter((a) => ASSOCIATIONS.every(([doc, step]) => doc !== a.id || locked.has(step))).map((a) => a.id),
+  );
+}
+
+/** Documentos (por nombre) deshabilitados en todos los lugares donde aparecen: no cuentan en las estadísticas. */
+export function disabledDocKeys(lockedArts: Set<string>): Set<string> {
+  return new Set(DOC_KEYS.filter((k) => ARTIFACTS.every((a) => docKey(a) !== k || lockedArts.has(a.id))));
+}
+
 /** Parte un texto en líneas de como máximo `max` caracteres (por palabras). */
 export function wrapWords(text: string, max: number): string[] {
   const lines: string[] = [];
@@ -564,11 +692,24 @@ export function phaseOf(x: number): string {
   return PHASES.find((P) => x >= P.x0 && x < P.x1)?.n ?? "";
 }
 
-/** Resumen de avance de un flujo: conteo por estado, avance por fase y documentos enlazados. */
-export function summarize({ nodes, links = {}, docs: docStatus = {} }: Pick<Flow, "nodes" | "links" | "docs">) {
+/**
+ * Resumen de avance de un flujo: conteo por estado, avance por fase y documentos
+ * enlazados. Los pasos y documentos deshabilitados (rama descartada o final cerrado
+ * por otro camino) no cuentan: nunca se van a hacer.
+ */
+export function summarize(
+  flow: Pick<Flow, "nodes" | "links" | "docs"> & Partial<Pick<Flow, "closed" | "gatewayAnswers">>,
+) {
+  const { nodes, links = {}, docs: docStatus = {} } = flow;
+  const locked = lockedNodes({ closed: flow.closed, gatewayAnswers: flow.gatewayAnswers });
+  const disabled = disabledDocKeys(lockedArtifacts(locked));
+  const activeDocs = DOC_KEYS.filter((k) => !disabled.has(k));
   const counts: Record<Status, number> = { todo: 0, prog: 0, test: 0, done: 0 };
   const phases = PHASES.map((p) => ({ name: p.n, total: 0, done: 0 }));
+  let total = 0;
   for (const n of EDITABLE) {
+    if (locked.has(n.id)) continue;
+    total++;
     const s = nodes[n.id]?.s ?? "todo";
     counts[s]++;
     const ph = phases.find((p) => p.name === phaseOf(n.x));
@@ -579,10 +720,11 @@ export function summarize({ nodes, links = {}, docs: docStatus = {} }: Pick<Flow
   }
   const current = phases.find((p) => p.done < p.total)?.name ?? null;
   const docs = {
-    linked: DOC_KEYS.filter((k) => links[k]).length,
-    done: DOC_KEYS.filter((k) => docStatus[k] === "done").length,
-    prog: DOC_KEYS.filter((k) => docStatus[k] === "prog").length,
-    total: DOC_KEYS.length,
+    linked: activeDocs.filter((k) => links[k]).length,
+    done: activeDocs.filter((k) => docStatus[k] === "done").length,
+    prog: activeDocs.filter((k) => docStatus[k] === "prog").length,
+    total: activeDocs.length,
+    disabled: disabled.size,
   };
-  return { counts, total: EDITABLE.length, phases, current, docs };
+  return { counts, total, phases, current, docs };
 }
