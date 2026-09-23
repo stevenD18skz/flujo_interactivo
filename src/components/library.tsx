@@ -190,7 +190,7 @@ export function Library() {
 function Stats({ items }: { items: Item[] }) {
   const finished = items.filter((i) => i.sum.current === null).length;
   const stepsDone = items.reduce((a, i) => a + i.sum.counts.done, 0);
-  const stepsTotal = items.length * EDITABLE.length;
+  const stepsTotal = items.reduce((a, i) => a + i.sum.total, 0);
   const docsDone = items.reduce((a, i) => a + i.sum.docs.done, 0);
   const docsTotal = items.reduce((a, i) => a + i.sum.docs.total, 0);
   const byPhase = PHASES.map((p) => ({ name: p.n, n: items.filter((i) => i.sum.current === p.n).length }));
@@ -373,14 +373,16 @@ function PhaseStepper({ phases, current }: { phases: Summary["phases"]; current:
   return (
     <ol className="flex" aria-label="Avance por fase">
       {phases.map((p, i) => {
-        const complete = p.done === p.total;
+        // Sin pasos activos: todos quedaron fuera del camino (rama descartada o cierre).
+        const skipped = p.total === 0;
+        const complete = !skipped && p.done === p.total;
         const isCurrent = p.name === current;
         const prevComplete = i > 0 && phases[i - 1].done === phases[i - 1].total;
         return (
           <li
             key={p.name}
             className="relative flex flex-1 flex-col items-center gap-1.5"
-            title={`${p.name}: ${p.done}/${p.total} pasos`}
+            title={skipped ? `${p.name}: no aplica` : `${p.name}: ${p.done}/${p.total} pasos`}
           >
             {i > 0 && (
               <span
@@ -389,7 +391,9 @@ function PhaseStepper({ phases, current }: { phases: Summary["phases"]; current:
                 style={{ left: "calc(-50% + 12px)", right: "calc(50% + 12px)" }}
               />
             )}
-            {complete ? (
+            {skipped ? (
+              <span className="size-5 rounded-full border-2 border-dashed border-line bg-chrome opacity-60" />
+            ) : complete ? (
               <span className="grid size-5 place-items-center rounded-full bg-done-line text-[10px] font-bold text-white">
                 ✓
               </span>
@@ -409,7 +413,9 @@ function PhaseStepper({ phases, current }: { phases: Summary["phases"]; current:
               {p.name}
             </span>
             <span className="sr-only">
-              {complete ? "completa" : isCurrent ? "fase actual" : "pendiente"}, {p.done} de {p.total} pasos
+              {skipped
+                ? "no aplica"
+                : `${complete ? "completa" : isCurrent ? "fase actual" : "pendiente"}, ${p.done} de ${p.total} pasos`}
             </span>
           </li>
         );

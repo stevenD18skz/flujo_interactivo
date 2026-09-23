@@ -2,10 +2,12 @@
 
 import { createClient, type Client, type InStatement, type Row } from "@libsql/client";
 import {
-  branchLock,
-  gatewayBranches,
+  aliasesOf,
+  priorCompletion,
   upstreamSteps,
+  withDocAliases,
   type ClosedState,
+  type Completion,
   type DocStatus,
   type Flow,
   type Material,
@@ -118,8 +120,8 @@ function toFlow(r: Row): Flow {
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
     nodes: parseJson<Record<string, NodeState>>(r.nodes),
-    links: parseJson<Record<string, string>>(r.links),
-    docs: parseJson<Record<string, DocStatus>>(r.doc_status),
+    links: withDocAliases(parseJson<Record<string, string>>(r.links)),
+    docs: withDocAliases(parseJson<Record<string, DocStatus>>(r.doc_status)),
     closed: parseClosedState(r.closed_state),
     gatewayAnswers: parseJson<Record<string, string>>(r.gateway_answers),
   };
@@ -219,15 +221,40 @@ export async function deleteFlow(id: string): Promise<string[]> {
 const jsonPath = (key: string) => `$."${key}"`;
 
 /** Mezcla `patch` en el estado de un paso sin tocar el resto de pasos. */
-export async function patchNode(id: string, nodeId: string, patch: NodeState) {
+function patchNodeStmt(id: string, nodeId: string, patch: NodeState): InStatement {
   const path = jsonPath(nodeId);
-  await (await db()).execute({
+  return {
     sql: `UPDATE flows
           SET nodes = json_set(nodes, ?, json(json_patch(coalesce(json_extract(nodes, ?), '{}'), ?))),
               updated_at = ?
           WHERE id = ?`,
     args: [path, path, JSON.stringify(patch), Date.now(), id],
-  });
+  };
+}
+
+export async function patchNode(id: string, nodeId: string, patch: NodeState) {
+  await (await db()).execute(patchNodeStmt(id, nodeId, patch));
+}
+
+/** Pasos previos a "done" y compuertas del camino respondidas (ver priorCompletion). */
+function completionStmts(flowId: string, { steps, answers }: Completion): InStatement[] {
+  return [
+    ...steps.map((sid) => nodeSetDoneStmt(flowId, sid)),
+    ...Object.entries(answers).map(([gid, target]) => ({
+      sql: "UPDATE flows SET gateway_answers = json_set(gateway_answers, ?, ?) WHERE id = ?",
+      args: [jsonPath(gid), target, flowId],
+    })),
+  ];
+}
+
+/**
+ * Estado de un paso. Cualquier estado distinto de "todo" también completa lo
+ * anterior (se recalcula aquí a partir del paso, nunca se confía en una lista
+ * enviada por el cliente).
+ */
+export async function setNodeStatus(id: string, nodeId: string, s: NonNullable<NodeState["s"]>) {
+  if (s === "todo") return patchNode(id, nodeId, { s });
+  await (await db()).batch([...completionStmts(id, priorCompletion(nodeId)), patchNodeStmt(id, nodeId, { s })], "write");
 }
 
 /** Asigna (o quita, con `null`) una clave de un objeto JSON de la fila. */
@@ -237,55 +264,60 @@ async function setJsonKey(
   key: string,
   value: string | null,
 ) {
+  await (await db()).execute(setJsonKeyStmt(column, id, key, value));
+}
+
+function setJsonKeyStmt(
+  column: "links" | "doc_status" | "gateway_answers",
+  id: string,
+  key: string,
+  value: string | null,
+): InStatement {
   const path = jsonPath(key);
-  await (await db()).execute(
-    value
-      ? {
-          sql: `UPDATE flows SET ${column} = json_set(${column}, ?, ?), updated_at = ? WHERE id = ?`,
-          args: [path, value, Date.now(), id],
-        }
-      : {
-          sql: `UPDATE flows SET ${column} = json_remove(${column}, ?), updated_at = ? WHERE id = ?`,
-          args: [path, Date.now(), id],
-        },
+  return value
+    ? {
+        sql: `UPDATE flows SET ${column} = json_set(${column}, ?, ?), updated_at = ? WHERE id = ?`,
+        args: [path, value, Date.now(), id],
+      }
+    : {
+        sql: `UPDATE flows SET ${column} = json_remove(${column}, ?), updated_at = ? WHERE id = ?`,
+        args: [path, Date.now(), id],
+      };
+}
+
+/**
+ * Como setJsonKey, pero también borra los nombres viejos del documento (ver
+ * DOC_ALIASES), para que su valor no reaparezca como respaldo al leer.
+ */
+async function setDocKey(column: "links" | "doc_status", id: string, key: string, value: string | null) {
+  await (await db()).batch(
+    [...aliasesOf(key).map((a) => setJsonKeyStmt(column, id, a, null)), setJsonKeyStmt(column, id, key, value)],
+    "write",
   );
 }
 
 export async function setDocLink(id: string, docKey: string, url: string | null) {
-  await setJsonKey("links", id, docKey, url);
+  await setDocKey("links", id, docKey, url);
 }
 
 /** "empty" es el estado por defecto, así que se guarda quitando la clave. */
 export async function setDocStatus(id: string, docKey: string, status: DocStatus) {
-  await setJsonKey("doc_status", id, docKey, status === "empty" ? null : status);
+  await setDocKey("doc_status", id, docKey, status === "empty" ? null : status);
 }
 
 /**
  * Respuesta de una compuerta que NO lleva directo a un final (`target` = null la
- * borra). Responder marca "done" los pasos previos que llevaron hasta acá (salvo
- * los que pertenecen solo a la rama que NO se tomó, ver `branchLock`); se
- * recalcula aquí, nunca se confía en pasos que mande el cliente.
+ * borra). Responder marca "done" los pasos previos y responde las compuertas
+ * anteriores (ver priorCompletion); se recalcula aquí, nunca se confía en pasos
+ * que mande el cliente.
  */
 export async function setGatewayAnswer(id: string, gatewayId: string, target: string | null) {
   if (!target) {
     await setJsonKey("gateway_answers", id, gatewayId, null);
     return;
   }
-  const other = gatewayBranches(gatewayId).find((b) => b.target !== target);
-  const discarded = other ? branchLock(other.target) : new Set<string>();
-  // La rama elegida también se excluye: en un rework-loop el paso de corrección
-  // es ancestro de la compuerta por el ciclo, pero todavía no ocurrió esta vuelta.
-  const chosenForward = branchLock(target);
-  const toMarkDone = upstreamSteps(gatewayId).filter((sid) => !discarded.has(sid) && !chosenForward.has(sid));
-  const path = jsonPath(gatewayId);
   await (await db()).batch(
-    [
-      ...toMarkDone.map((sid) => nodeSetDoneStmt(id, sid)),
-      {
-        sql: `UPDATE flows SET gateway_answers = json_set(gateway_answers, ?, ?), updated_at = ? WHERE id = ?`,
-        args: [path, target, Date.now(), id],
-      },
-    ],
+    [...completionStmts(id, priorCompletion(gatewayId)), setJsonKeyStmt("gateway_answers", id, gatewayId, target)],
     "write",
   );
 }
